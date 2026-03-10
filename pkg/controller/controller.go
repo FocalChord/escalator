@@ -42,6 +42,14 @@ type NodeGroupState struct {
 	// used for storing cached instance capacity
 	cpuCapacity resource.Quantity
 	memCapacity resource.Quantity
+
+	// ring buffers for smoothing scale-down utilisation signal
+	scaleDownCPUUtilBuffer *utilisationBuffer
+	scaleDownMemUtilBuffer *utilisationBuffer
+
+	// ring buffers for smoothing scale-up utilisation signal
+	scaleUpCPUUtilBuffer *utilisationBuffer
+	scaleUpMemUtilBuffer *utilisationBuffer
 }
 
 // Opts provide the Controller with config for runtime
@@ -100,7 +108,11 @@ func NewController(opts Opts, stopChan <-chan struct{}) (*Controller, error) {
 				minimumLockDuration: nodeGroupOpts.ScaleUpCoolDownPeriodDuration(),
 				nodegroup:           nodeGroupOpts.Name,
 			},
-			scaleDelta: 0,
+			scaleDelta:             0,
+			scaleDownCPUUtilBuffer: newUtilisationBuffer(nodeGroupOpts.ScaleDownUtilisationAverageSamples),
+			scaleDownMemUtilBuffer: newUtilisationBuffer(nodeGroupOpts.ScaleDownUtilisationAverageSamples),
+			scaleUpCPUUtilBuffer:   newUtilisationBuffer(nodeGroupOpts.ScaleUpUtilisationAverageSamples),
+			scaleUpMemUtilBuffer:   newUtilisationBuffer(nodeGroupOpts.ScaleUpUtilisationAverageSamples),
 		}
 	}
 
@@ -342,6 +354,12 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 	} else {
 		metrics.NodeGroupsCPUPercent.WithLabelValues(nodegroup).Set(cpuPercent)
 		metrics.NodeGroupsMemPercent.WithLabelValues(nodegroup).Set(memPercent)
+
+		// Add to all smoothing buffers (only real values, not scale-from-zero sentinels)
+		nodeGroup.scaleDownCPUUtilBuffer.add(cpuPercent)
+		nodeGroup.scaleDownMemUtilBuffer.add(memPercent)
+		nodeGroup.scaleUpCPUUtilBuffer.add(cpuPercent)
+		nodeGroup.scaleUpMemUtilBuffer.add(memPercent)
 	}
 
 	locked := nodeGroup.scaleUpLock.locked()
@@ -356,20 +374,48 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 
 	// Perform the scaling decision
 	maxPercent := math.Max(cpuPercent, memPercent)
+
+	// Compute smoothed values for scaling decisions; use raw values for scale-from-zero
+	var smoothedScaleDownMaxPercent, smoothedScaleUpMaxPercent float64
+	if cpuPercent == math.MaxFloat64 || memPercent == math.MaxFloat64 {
+		smoothedScaleDownMaxPercent = maxPercent
+		smoothedScaleUpMaxPercent = maxPercent
+	} else {
+		smoothedScaleDownMaxPercent = math.Max(
+			nodeGroup.scaleDownCPUUtilBuffer.average(),
+			nodeGroup.scaleDownMemUtilBuffer.average(),
+		)
+		smoothedScaleUpMaxPercent = math.Max(
+			nodeGroup.scaleUpCPUUtilBuffer.average(),
+			nodeGroup.scaleUpMemUtilBuffer.average(),
+		)
+	}
+
+	if nodeGroup.Opts.ScaleDownUtilisationAverageSamples > 1 || nodeGroup.Opts.ScaleUpUtilisationAverageSamples > 1 {
+		log.WithField("nodegroup", nodegroup).Infof(
+			"smoothed scale-down: %.2f%%, smoothed scale-up: %.2f%% (raw: %.2f%%, down samples: %v, up samples: %v)",
+			smoothedScaleDownMaxPercent,
+			smoothedScaleUpMaxPercent,
+			maxPercent,
+			nodeGroup.Opts.ScaleDownUtilisationAverageSamples,
+			nodeGroup.Opts.ScaleUpUtilisationAverageSamples,
+		)
+	}
+
 	nodesDelta := 0
 
 	// Determine if we want to scale up or down. Selects the first condition that is true
 	switch {
 	// --- Scale Down conditions ---
 	// reached very low %. aggressively remove nodes
-	case maxPercent < float64(nodeGroup.Opts.TaintLowerCapacityThresholdPercent):
+	case smoothedScaleDownMaxPercent < float64(nodeGroup.Opts.TaintLowerCapacityThresholdPercent):
 		nodesDelta = -nodeGroup.Opts.FastNodeRemovalRate
 	// reached medium low %. slowly remove nodes
-	case maxPercent < float64(nodeGroup.Opts.TaintUpperCapacityThresholdPercent):
+	case smoothedScaleDownMaxPercent < float64(nodeGroup.Opts.TaintUpperCapacityThresholdPercent):
 		nodesDelta = -nodeGroup.Opts.SlowNodeRemovalRate
 	// --- Scale Up conditions ---
 	// Need to scale up so capacity can handle requests
-	case maxPercent > float64(nodeGroup.Opts.ScaleUpThresholdPercent):
+	case smoothedScaleUpMaxPercent > float64(nodeGroup.Opts.ScaleUpThresholdPercent):
 		// if ScaleUpThresholdPercent is our "max target" or "slack capacity"
 		// we want to add enough nodes such that the maxPercentage cluster util
 		// drops back below ScaleUpThresholdPercent

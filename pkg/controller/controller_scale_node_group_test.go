@@ -1497,3 +1497,195 @@ func TestScaleNodeGroupNodeMaxAge(t *testing.T) {
 		})
 	}
 }
+
+func TestUtilisationSmoothing(t *testing.T) {
+	type args struct {
+		nodes            []*v1.Node
+		pods             []*v1.Pod
+		nodeGroupOptions NodeGroupOptions
+		listerOptions    ListerOptions
+	}
+
+	tests := []struct {
+		name                     string
+		args                     args
+		prefillScaleDownCPU      []float64
+		prefillScaleDownMem      []float64
+		prefillScaleUpCPU        []float64
+		prefillScaleUpMem        []float64
+		expectedNodeDelta        int
+		err                      error
+	}{
+		{
+			"scale-down smoothing prevents action on transient dip",
+			args{
+				buildTestNodes(10, 2000, 8000),
+				buildTestPods(10, 900, 1000), // ~45% CPU utilisation
+				NodeGroupOptions{
+					Name:                               "default",
+					CloudProviderGroupName:             "default",
+					MinNodes:                           5,
+					MaxNodes:                           100,
+					ScaleUpThresholdPercent:            70,
+					TaintUpperCapacityThresholdPercent: 50,
+					TaintLowerCapacityThresholdPercent: 30,
+					SlowNodeRemovalRate:                1,
+					FastNodeRemovalRate:                2,
+					ScaleDownUtilisationAverageSamples: 5,
+					ScaleUpUtilisationAverageSamples:   1,
+				},
+				ListerOptions{},
+			},
+			[]float64{55.0, 55.0, 55.0, 55.0}, // prefill scale-down CPU buffer
+			[]float64{55.0, 55.0, 55.0, 55.0}, // prefill scale-down mem buffer
+			nil,
+			nil,
+			0, // smoothed scale-down ~53% > 50% threshold, no action
+			nil,
+		},
+		{
+			"scale-up smoothing can delay scale-up when configured",
+			args{
+				buildTestNodes(10, 2000, 8000),
+				buildTestPods(38, 500, 1000), // 95% CPU utilisation
+				NodeGroupOptions{
+					Name:                               "default",
+					CloudProviderGroupName:             "default",
+					MinNodes:                           5,
+					MaxNodes:                           100,
+					ScaleUpThresholdPercent:            70,
+					TaintUpperCapacityThresholdPercent: 50,
+					TaintLowerCapacityThresholdPercent: 30,
+					SlowNodeRemovalRate:                1,
+					FastNodeRemovalRate:                2,
+					ScaleDownUtilisationAverageSamples: 1,
+					ScaleUpUtilisationAverageSamples:   5,
+				},
+				ListerOptions{},
+			},
+			nil,
+			nil,
+			[]float64{50.0, 50.0, 50.0, 50.0}, // prefill scale-up CPU buffer
+			[]float64{50.0, 50.0, 50.0, 50.0}, // prefill scale-up mem buffer
+			0, // smoothed scale-up ~59% < 70% threshold, no scale-up
+			nil,
+		},
+		{
+			"scale-up with samples=1 remains reactive",
+			args{
+				buildTestNodes(10, 2000, 8000),
+				buildTestPods(38, 500, 1000), // 95% CPU utilisation
+				NodeGroupOptions{
+					Name:                               "default",
+					CloudProviderGroupName:             "default",
+					MinNodes:                           5,
+					MaxNodes:                           100,
+					ScaleUpThresholdPercent:            70,
+					TaintUpperCapacityThresholdPercent: 50,
+					TaintLowerCapacityThresholdPercent: 30,
+					SlowNodeRemovalRate:                1,
+					FastNodeRemovalRate:                2,
+					ScaleDownUtilisationAverageSamples: 5,
+					ScaleUpUtilisationAverageSamples:   1,
+				},
+				ListerOptions{},
+			},
+			[]float64{60.0, 60.0, 60.0, 60.0}, // prefill scale-down CPU buffer above threshold
+			[]float64{60.0, 60.0, 60.0, 60.0}, // prefill scale-down mem buffer above threshold
+			nil,
+			nil,
+			4, // raw 95% > 70% triggers scale-up
+			nil,
+		},
+		{
+			"both configs at 0 preserves existing behavior",
+			args{
+				buildTestNodes(10, 2000, 8000),
+				buildTestPods(10, 900, 1000), // ~45% CPU utilisation
+				NodeGroupOptions{
+					Name:                               "default",
+					CloudProviderGroupName:             "default",
+					MinNodes:                           5,
+					MaxNodes:                           100,
+					ScaleUpThresholdPercent:            70,
+					TaintUpperCapacityThresholdPercent: 50,
+					TaintLowerCapacityThresholdPercent: 30,
+					SlowNodeRemovalRate:                1,
+					FastNodeRemovalRate:                2,
+					ScaleDownUtilisationAverageSamples: 0,
+					ScaleUpUtilisationAverageSamples:   0,
+				},
+				ListerOptions{},
+			},
+			nil,
+			nil,
+			nil,
+			nil,
+			-1, // 45% < 50% triggers slow scale-down
+			nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodeGroups := []NodeGroupOptions{tt.args.nodeGroupOptions}
+			ngName := tt.args.nodeGroupOptions.Name
+			client, opts, err := buildTestClient(tt.args.nodes, tt.args.pods, nodeGroups, tt.args.listerOptions)
+			require.NoError(t, err)
+
+			// For these test cases we only use 1 node group/cloud provider node group
+			nodeGroupSize := 1
+
+			// Create a test (mock) cloud provider
+			testCloudProvider := test.NewCloudProvider(nodeGroupSize)
+			testNodeGroup := test.NewNodeGroup(
+				tt.args.nodeGroupOptions.CloudProviderGroupName,
+				tt.args.nodeGroupOptions.Name,
+				int64(tt.args.nodeGroupOptions.MinNodes),
+				int64(tt.args.nodeGroupOptions.MaxNodes),
+				int64(len(tt.args.nodes)),
+			)
+			testCloudProvider.RegisterNodeGroup(testNodeGroup)
+
+			// Create a node group state with the mapping of node groups to the cloud providers node groups
+			nodeGroupsState := BuildNodeGroupsState(nodeGroupsStateOpts{
+				nodeGroups: nodeGroups,
+				client:     *client,
+			})
+
+			// Pre-fill the utilisation buffers as specified
+			state := nodeGroupsState[ngName]
+			for _, v := range tt.prefillScaleDownCPU {
+				state.scaleDownCPUUtilBuffer.add(v)
+			}
+			for _, v := range tt.prefillScaleDownMem {
+				state.scaleDownMemUtilBuffer.add(v)
+			}
+			for _, v := range tt.prefillScaleUpCPU {
+				state.scaleUpCPUUtilBuffer.add(v)
+			}
+			for _, v := range tt.prefillScaleUpMem {
+				state.scaleUpMemUtilBuffer.add(v)
+			}
+
+			controller := &Controller{
+				Client:        client,
+				Opts:          opts,
+				stopChan:      nil,
+				nodeGroups:    nodeGroupsState,
+				cloudProvider: testCloudProvider,
+			}
+
+			nodesDelta, err := controller.scaleNodeGroup(ngName, nodeGroupsState[ngName])
+
+			// Ensure there were no errors
+			if tt.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, tt.err, err.Error())
+			}
+
+			assert.Equal(t, tt.expectedNodeDelta, nodesDelta)
+		})
+	}
+}

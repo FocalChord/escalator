@@ -63,6 +63,18 @@ type NodeGroupOptions struct {
 	// allowed in the nodegroup at any given time.
 	MaxUnhealthyNodesPercent int `json:"max_unhealthy_nodes_percent,omitempty" yaml:"max_unhealthy_nodes_percent,omitempty"`
 
+	// ScaleDownUtilisationAverageSamples is the number of recent utilisation samples
+	// to average before making scale-down decisions. A value of 0 or 1 means no
+	// smoothing (current behavior). Higher values smooth out short-term noise.
+	// With a 30-second scan interval, a value of 5 gives a 2.5-minute smoothing window.
+	ScaleDownUtilisationAverageSamples int `json:"scale_down_utilisation_average_samples,omitempty" yaml:"scale_down_utilisation_average_samples,omitempty"`
+
+	// ScaleUpUtilisationAverageSamples is the number of recent utilisation samples
+	// to average before making scale-up decisions. A value of 0 or 1 means no
+	// smoothing (current behavior). Set this lower than the scale-down value if
+	// you want scale-up to remain reactive while scale-down is cautious.
+	ScaleUpUtilisationAverageSamples int `json:"scale_up_utilisation_average_samples,omitempty" yaml:"scale_up_utilisation_average_samples,omitempty"`
+
 	// Private variables for storing the parsed duration from the string
 	softDeleteGracePeriodDuration    time.Duration
 	hardDeleteGracePeriodDuration    time.Duration
@@ -387,6 +399,10 @@ func BuildNodeGroupsState(opts nodeGroupsStateOpts) map[string]*NodeGroupState {
 				minimumLockDuration: ng.ScaleUpCoolDownPeriodDuration(),
 				nodegroup:           ng.Name,
 			},
+			scaleDownCPUUtilBuffer: newUtilisationBuffer(ng.ScaleDownUtilisationAverageSamples),
+			scaleDownMemUtilBuffer: newUtilisationBuffer(ng.ScaleDownUtilisationAverageSamples),
+			scaleUpCPUUtilBuffer:   newUtilisationBuffer(ng.ScaleUpUtilisationAverageSamples),
+			scaleUpMemUtilBuffer:   newUtilisationBuffer(ng.ScaleUpUtilisationAverageSamples),
 		}
 	}
 	return nodeGroupsState
